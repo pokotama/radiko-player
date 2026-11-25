@@ -3,7 +3,10 @@
 // 再生位置をドライブ上の同期ファイルでやり取りする。
 
 const CLIENT_ID = "2927916612-nsqr58e6lp0c15sqo1unuiciqnh7s6r8.apps.googleusercontent.com";
-const SCOPE = "https://www.googleapis.com/auth/drive.file";
+// スコープは drive（読み書き）。
+// 拡張機能が上げたファイルや手動で置いたファイルを読むには drive.file では不足で、
+// かつ再生位置の同期ファイルへ書き込む必要があるため。
+const SCOPE = "https://www.googleapis.com/auth/drive";
 const FOLDER_NAME = "RadikoRecordings";
 const SYNC_FILENAME = "radiko-sync.json";
 const DRIVE_API = "https://www.googleapis.com/drive/v3";
@@ -143,7 +146,13 @@ async function listFiles() {
     `${DRIVE_API}/files?q=${q}&fields=files(id,name,size,mimeType,modifiedTime,appProperties)&pageSize=200`,
   );
   const json = await res.json();
-  return (json.files || []).filter((f) => f.name !== SYNC_FILENAME);
+  // 同期用JSONと、音声以外のファイルは除外する。
+  return (json.files || []).filter(
+    (f) =>
+      f.name !== SYNC_FILENAME &&
+      f.mimeType !== "application/vnd.google-apps.folder" &&
+      !f.name.endsWith(".json"),
+  );
 }
 
 async function loadPositions() {
@@ -248,13 +257,29 @@ function syncKeyOf(file) {
   return file.appProperties?.syncKey || `name:${file.name}`;
 }
 
+// ファイル名「番組名_YYYYMMDD.webm」から番組名と放送日を取り出す。
+// （手動でドライブに置いたファイル用のフォールバック）
+function parseFilename(name) {
+  const base = name.replace(/\.[^.]+$/, "");
+  const m = /^(.*)_(\d{4})(\d{2})(\d{2})$/.exec(base);
+  if (!m) {
+    return { title: base, broadcastAt: 0 };
+  }
+  const [, title, y, mo, d] = m;
+  const ms = Date.parse(`${y}-${mo}-${d}T00:00:00+09:00`);
+  return { title: title || base, broadcastAt: Number.isFinite(ms) ? ms : 0 };
+}
+
 function titleOf(file) {
-  return file.appProperties?.title || file.name.replace(/\.[^.]+$/, "");
+  return file.appProperties?.title || parseFilename(file.name).title;
 }
 
 function broadcastOf(file) {
   const v = file.appProperties?.broadcastAt;
-  return v ? Number(v) : 0;
+  if (v) {
+    return Number(v);
+  }
+  return parseFilename(file.name).broadcastAt;
 }
 
 async function renderList() {
