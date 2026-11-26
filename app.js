@@ -405,10 +405,14 @@ async function playFile(file) {
     const saved = positions[key]?.position || 0;
     audio.addEventListener(
       "loadedmetadata",
-      () => {
-        const dur = Number.isFinite(audio.duration) ? audio.duration : 0;
-        if (saved > 0 && (!dur || saved < dur - 1)) {
-          audio.currentTime = saved;
+      async () => {
+        // 実際の長さを確定させてから位置を戻す。
+        await resolveRealDuration();
+        const dur = getDuration();
+        if (saved > 0) {
+          audio.currentTime = dur > 0 ? Math.min(saved, dur) : saved;
+        } else {
+          audio.currentTime = 0;
         }
         syncSeekUi();
       },
@@ -424,12 +428,58 @@ async function playFile(file) {
   }
 }
 
+// MediaRecorder が作る webm は長さのメタデータを持たず、duration が Infinity になる。
+// そのままだとシークできないので、一度終端へシークして実際の長さを確定させる。
+function resolveRealDuration() {
+  return new Promise((resolve) => {
+    if (Number.isFinite(audio.duration) && audio.duration > 0) {
+      resolve();
+      return;
+    }
+
+    let settled = false;
+    const finish = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      audio.removeEventListener("durationchange", onChange);
+      resolve();
+    };
+
+    const onChange = () => {
+      if (Number.isFinite(audio.duration) && audio.duration > 0) {
+        audio.currentTime = 0;
+        finish();
+      }
+    };
+
+    audio.addEventListener("durationchange", onChange);
+    try {
+      audio.currentTime = 1e101;
+    } catch (_e) {
+      finish();
+    }
+    setTimeout(finish, 5000);
+  });
+}
+
+// 再生時間。取れなければドライブに記録された録音時間を使う。
+function getDuration() {
+  if (Number.isFinite(audio.duration) && audio.duration > 0) {
+    return audio.duration;
+  }
+  const fallback = Number(current?.file?.appProperties?.duration || 0) / 1000;
+  return Number.isFinite(fallback) && fallback > 0 ? fallback : 0;
+}
+
 function syncSeekUi() {
-  const dur = Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : 0;
+  const dur = getDuration();
   const pos = Number.isFinite(audio.currentTime) ? audio.currentTime : 0;
+  const clamped = dur > 0 ? Math.min(Math.max(pos, 0), dur) : 0;
   seek.max = String(dur);
-  seek.value = String(Math.min(pos, dur || pos));
-  currentTimeEl.textContent = formatTime(pos);
+  seek.value = String(clamped);
+  currentTimeEl.textContent = formatTime(clamped);
   durationTimeEl.textContent = formatTime(dur);
 }
 
@@ -466,13 +516,13 @@ function updateMediaSession(file) {
   navigator.mediaSession.setActionHandler("play", () => audio.play());
   navigator.mediaSession.setActionHandler("pause", () => audio.pause());
   navigator.mediaSession.setActionHandler("nexttrack", () => seekBy(30));
-  navigator.mediaSession.setActionHandler("previoustrack", () => seekBy(-15));
+  navigator.mediaSession.setActionHandler("previoustrack", () => seekBy(-10));
   navigator.mediaSession.setActionHandler("seekforward", (d) => seekBy(d?.seekOffset || 30));
-  navigator.mediaSession.setActionHandler("seekbackward", (d) => seekBy(-(d?.seekOffset || 15)));
+  navigator.mediaSession.setActionHandler("seekbackward", (d) => seekBy(-(d?.seekOffset || 10)));
 }
 
 function seekBy(sec) {
-  const dur = Number.isFinite(audio.duration) ? audio.duration : 0;
+  const dur = getDuration();
   audio.currentTime = Math.min(Math.max(audio.currentTime + sec, 0), dur || audio.currentTime);
   syncSeekUi();
   savePosition(true);
@@ -496,7 +546,7 @@ audio.addEventListener("ended", () => {
   // 聞き終わった印として終端を残す。
   if (current) {
     positions[current.key] = {
-      position: Number.isFinite(audio.duration) ? audio.duration : audio.currentTime,
+      position: getDuration() || audio.currentTime,
       updatedAt: Date.now(),
       device: DEVICE,
     };
