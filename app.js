@@ -370,6 +370,30 @@ async function renderList() {
     });
     actions.append(dlBtn);
 
+    const delBtn = document.createElement("button");
+    delBtn.className = "danger";
+    delBtn.textContent = "削除";
+    delBtn.addEventListener("click", async () => {
+      const ok = window.confirm(
+        `「${titleOf(file)}」を削除します。\nGoogleドライブから消え、他の端末でも聞けなくなります。\n（ドライブのゴミ箱から復元できます）よろしいですか？`,
+      );
+      if (!ok) {
+        return;
+      }
+      delBtn.disabled = true;
+      delBtn.textContent = "削除中...";
+      try {
+        await deleteFile(file);
+        setStatus("削除しました。");
+        await renderList();
+      } catch (error) {
+        setStatus(error.message, "error");
+        delBtn.disabled = false;
+        delBtn.textContent = "削除";
+      }
+    });
+    actions.append(delBtn);
+
     card.append(actions);
     listEl.append(card);
   }
@@ -378,6 +402,38 @@ async function renderList() {
 async function fetchFileBlob(file) {
   const res = await api(`${DRIVE_API}/files/${file.id}?alt=media`);
   return res.blob();
+}
+
+// ドライブから削除する（ゴミ箱へ移すので復元可能）。
+// あわせて再生位置の記録と端末内のキャッシュも消す。
+async function deleteFile(file) {
+  await api(`${DRIVE_API}/files/${file.id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ trashed: true }),
+  });
+
+  const key = syncKeyOf(file);
+  if (key in positions) {
+    delete positions[key];
+    await savePositions().catch(() => {});
+  }
+
+  await deleteCached(file.id);
+
+  // 再生中のものを消したら止める。
+  if (current?.file.id === file.id) {
+    audio.pause();
+    audio.removeAttribute("src");
+    audio.load();
+    if (current.objectUrl) {
+      URL.revokeObjectURL(current.objectUrl);
+    }
+    current = null;
+    playerEl.hidden = true;
+  }
+
+  files = files.filter((f) => f.id !== file.id);
 }
 
 // ---------- 再生 ----------

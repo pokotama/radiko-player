@@ -127,6 +127,10 @@ button {
   font-size: 0.85rem;
 }
 
+.danger {
+  color: var(--accent-dark);
+}
+
 .progress-bar {
   margin-top: 8px;
   height: 4px;
