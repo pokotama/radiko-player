@@ -75,27 +75,60 @@ function formatSize(bytes) {
 
 // ---------- 認証 ----------
 
+// トークンは localStorage に有効期限と一緒に残す。
+// （sessionStorage だとアプリを閉じるたびにログインが必要になる）
+function saveToken(token, expiresIn) {
+  accessToken = token;
+  const expiry = Date.now() + (Number(expiresIn) || 3600) * 1000 - 60000;
+  localStorage.setItem("token", token);
+  localStorage.setItem("tokenExpiry", String(expiry));
+}
+
+function loadSavedToken() {
+  const token = localStorage.getItem("token");
+  const expiry = Number(localStorage.getItem("tokenExpiry") || 0);
+  if (token && Date.now() < expiry) {
+    accessToken = token;
+    return true;
+  }
+  return false;
+}
+
+function clearToken() {
+  accessToken = null;
+  localStorage.removeItem("token");
+  localStorage.removeItem("tokenExpiry");
+}
+
 function initAuth() {
   tokenClient = google.accounts.oauth2.initTokenClient({
     client_id: CLIENT_ID,
     scope: SCOPE,
     callback: async (res) => {
       if (res.error) {
-        setStatus(`ログインに失敗しました: ${res.error}`, "error");
+        // 無言での取得に失敗しただけ。オフライン表示のまま使える。
+        signInButton.hidden = false;
         return;
       }
-      accessToken = res.access_token;
-      sessionStorage.setItem("token", accessToken);
+      saveToken(res.access_token, res.expires_in);
       signInButton.textContent = "再ログイン";
       await loadAll();
     },
   });
 
-  const saved = sessionStorage.getItem("token");
-  if (saved) {
-    accessToken = saved;
-    loadAll().catch(() => requestToken());
+  if (loadSavedToken()) {
+    loadAll().catch(() => silentSignIn());
+    return;
   }
+  // 一度許可済みなら、画面を出さずに取り直せることが多い。
+  silentSignIn();
+}
+
+function silentSignIn() {
+  if (!tokenClient) {
+    return;
+  }
+  tokenClient.requestAccessToken({ prompt: "" });
 }
 
 function requestToken() {
@@ -103,7 +136,7 @@ function requestToken() {
     setStatus("認証を初期化できませんでした。通信環境を確認してください。", "error");
     return;
   }
-  tokenClient.requestAccessToken({ prompt: accessToken ? "" : "consent" });
+  tokenClient.requestAccessToken({ prompt: "consent" });
 }
 
 // ---------- Drive API ----------
@@ -117,8 +150,7 @@ async function api(url, options = {}) {
     },
   });
   if (res.status === 401) {
-    accessToken = null;
-    sessionStorage.removeItem("token");
+    clearToken();
     throw new Error("認証の有効期限が切れました。ログインし直してください。");
   }
   if (!res.ok) {
@@ -386,6 +418,16 @@ async function renderList() {
 
     const delBtn = document.createElement("button");
     delBtn.className = "danger";
+    // 未ログインだとドライブを触れないので、押せないことを明示する。
+    if (!accessToken) {
+      delBtn.textContent = "削除（要ログイン）";
+      delBtn.disabled = true;
+      delBtn.title = "ドライブからの削除にはログインが必要です。端末から消すだけなら「端末から削除」を使ってください。";
+      actions.append(delBtn);
+      card.append(actions);
+      listEl.append(card);
+      continue;
+    }
     delBtn.textContent = "削除";
     delBtn.addEventListener("click", async () => {
       const ok = window.confirm(
@@ -587,6 +629,7 @@ function syncSeekUi() {
   durationTimeEl.textContent = formatTime(dur);
 }
 
+// オフライン時は再生位置を手元にだけ残し、次につながったとき送る。
 async function savePosition(force = false) {
   if (!current) {
     return;
@@ -601,6 +644,10 @@ async function savePosition(force = false) {
     updatedAt: now,
     device: DEVICE,
   };
+  localStorage.setItem("positionsCache", JSON.stringify(positions));
+  if (!accessToken) {
+    return;
+  }
   try {
     await savePositions();
   } catch (_e) {
@@ -698,11 +745,35 @@ async function loadAll() {
   try {
     files = await listFiles();
     await loadPositions();
+    // オフライン時に一覧を出せるよう、手元にも控えを残す。
+    localStorage.setItem("filesCache", JSON.stringify(files));
+    localStorage.setItem("positionsCache", JSON.stringify(positions));
     await renderList();
     setStatus(`${files.length} 件の録音があります。`);
   } catch (error) {
-    setStatus(error.message, "error");
+    // 通信や認証がだめでも、ダウンロード済みの番組は聴けるようにする。
+    await loadOffline(error);
     throw error;
+  }
+}
+
+// 保存済みの情報だけで一覧を組み立てる（ログイン不要）。
+async function loadOffline(error) {
+  try {
+    const cachedFiles = JSON.parse(localStorage.getItem("filesCache") || "[]");
+    positions = JSON.parse(localStorage.getItem("positionsCache") || "{}");
+    const cached = await cachedIds();
+    // 端末に入っているものだけ表示する。
+    files = cachedFiles.filter((f) => cached.has(f.id));
+    await renderList();
+
+    if (files.length > 0) {
+      setStatus(`オフライン表示です。ダウンロード済みの ${files.length} 件を聴けます。`);
+    } else {
+      setStatus(`ログインすると番組一覧を取得できます。(${error?.message || "未ログイン"})`);
+    }
+  } catch (_e) {
+    setStatus("ログインしてください。", "error");
   }
 }
 
@@ -758,9 +829,14 @@ if (savedRate) {
 }
 
 // Google のライブラリ読み込み後に初期化する。
+// 先にオフライン分を出しておき、ログインが通ったら差し替える。
+loadOffline().catch(() => {});
+
 const gsi = document.createElement("script");
 gsi.src = "https://accounts.google.com/gsi/client";
 gsi.async = true;
 gsi.onload = initAuth;
-gsi.onerror = () => setStatus("Googleの認証ライブラリを読み込めませんでした。", "error");
+gsi.onerror = () => {
+  setStatus("オフラインです。ダウンロード済みの番組は聴けます。");
+};
 document.head.append(gsi);
