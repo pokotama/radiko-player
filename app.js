@@ -16,6 +16,7 @@ const DEVICE = "phone";
 const statusEl = document.querySelector("#status");
 const listEl = document.querySelector("#list");
 const signInButton = document.querySelector("#signInButton");
+const downloadAllButton = document.querySelector("#downloadAllButton");
 const playerEl = document.querySelector("#player");
 const playerTitle = document.querySelector("#playerTitle");
 const audio = document.querySelector("#audio");
@@ -344,12 +345,28 @@ async function renderList() {
 
     const playBtn = document.createElement("button");
     playBtn.className = "primary";
-    playBtn.textContent = isCached ? "再生" : "再生（ストリーミング）";
-    playBtn.addEventListener("click", () => playFile(file));
+    playBtn.textContent = isCached ? "再生" : "ダウンロードして再生";
+    playBtn.addEventListener("click", async () => {
+      if (isCached) {
+        playFile(file);
+        return;
+      }
+      // 未ダウンロードなら先に端末へ保存してから再生する。
+      playBtn.disabled = true;
+      try {
+        await downloadFile(file, playBtn);
+        await renderList();
+        playFile(file);
+      } catch (error) {
+        setStatus(error.message, "error");
+        playBtn.disabled = false;
+        playBtn.textContent = "ダウンロードして再生";
+      }
+    });
     actions.append(playBtn);
 
     const dlBtn = document.createElement("button");
-    dlBtn.textContent = isCached ? "端末から削除" : "ダウンロード";
+    dlBtn.textContent = isCached ? "端末から削除" : "ダウンロードのみ";
     dlBtn.addEventListener("click", async () => {
       dlBtn.disabled = true;
       try {
@@ -357,10 +374,7 @@ async function renderList() {
           await deleteCached(file.id);
           setStatus("端末から削除しました。");
         } else {
-          dlBtn.textContent = "取得中...";
-          const blob = await fetchFileBlob(file);
-          await putCached(file.id, blob);
-          setStatus(`「${titleOf(file)}」を端末に保存しました。オフラインで聴けます。`);
+          await downloadFile(file, dlBtn);
         }
         await renderList();
       } catch (error) {
@@ -399,9 +413,43 @@ async function renderList() {
   }
 }
 
-async function fetchFileBlob(file) {
+// ファイルを取得する。大きいので進捗を返せるようにしている。
+async function fetchFileBlob(file, onProgress) {
   const res = await api(`${DRIVE_API}/files/${file.id}?alt=media`);
-  return res.blob();
+  const total = Number(file.size) || 0;
+
+  if (!res.body || !onProgress || !total) {
+    return res.blob();
+  }
+
+  const reader = res.body.getReader();
+  const chunks = [];
+  let received = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    chunks.push(value);
+    received += value.length;
+    onProgress(received, total);
+  }
+
+  return new Blob(chunks, { type: file.mimeType || "audio/webm" });
+}
+
+// 端末へ保存する。進捗をボタンに出す。
+async function downloadFile(file, button) {
+  const blob = await fetchFileBlob(file, (received, total) => {
+    const percent = Math.floor((received / total) * 100);
+    if (button) {
+      button.textContent = `${percent}%`;
+    }
+    setStatus(`「${titleOf(file)}」を取得中... ${percent}%`);
+  });
+  await putCached(file.id, blob);
+  setStatus(`「${titleOf(file)}」を端末に保存しました。オフラインで聴けます。`);
 }
 
 // ドライブから削除する（ゴミ箱へ移すので復元可能）。
@@ -659,6 +707,48 @@ async function loadAll() {
 }
 
 signInButton.addEventListener("click", requestToken);
+
+// 出かける前にまとめて落としておくためのボタン。
+downloadAllButton.addEventListener("click", async () => {
+  downloadAllButton.disabled = true;
+  const original = downloadAllButton.textContent;
+
+  try {
+    const cached = await cachedIds();
+    const targets = files.filter((f) => !cached.has(f.id));
+
+    if (targets.length === 0) {
+      setStatus("すべて端末に保存済みです。");
+      return;
+    }
+
+    let done = 0;
+    let failed = 0;
+
+    for (const file of targets) {
+      downloadAllButton.textContent = `保存中 (${done + failed + 1}/${targets.length})`;
+      try {
+        await downloadFile(file, null);
+        done += 1;
+      } catch (_e) {
+        failed += 1;
+      }
+    }
+
+    await renderList();
+    setStatus(
+      failed === 0
+        ? `${done} 件を端末に保存しました。オフラインで聴けます。`
+        : `${done} 件成功、${failed} 件失敗しました。`,
+      failed === 0 ? "ready" : "error",
+    );
+  } catch (error) {
+    setStatus(error.message, "error");
+  } finally {
+    downloadAllButton.disabled = false;
+    downloadAllButton.textContent = original;
+  }
+});
 
 const savedRate = localStorage.getItem("rate");
 if (savedRate) {
